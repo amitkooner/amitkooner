@@ -136,12 +136,14 @@ def member_names(league: dict) -> dict[str, str]:
     return out
 
 
-def owner_of(t: dict, members: dict[str, str]) -> tuple[str, str]:
-    """Returns (owner_id, owner_name). Uses the primary owner when there are co-owners."""
-    ids = t.get("owners") or ([t["primaryOwner"]] if t.get("primaryOwner") else [])
+def owner_of(t: dict, members: dict[str, str]) -> tuple[str, str, str]:
+    """Returns (primary_owner_id, primary_owner_name, all_owner_names)."""
+    ids = list(dict.fromkeys(t.get("owners") or []))
     primary = t.get("primaryOwner") or (ids[0] if ids else "")
-    names = " & ".join(members.get(i, i) for i in ids)
-    return primary, names
+    if primary and primary not in ids:
+        ids.insert(0, primary)
+    names = list(dict.fromkeys(members.get(i, i) for i in ids))
+    return primary, members.get(primary, primary), " & ".join(names)
 
 
 def scoring_periods(league: dict) -> dict[int, list[int]]:
@@ -188,17 +190,21 @@ def export_season(api: ESPN, season: int, tables: dict[str, list], skip_weekly: 
         return players.get(pid, {}).get("name") or ""
 
     # --- teams / standings
+    playoff_teams = league.get("settings", {}).get("scheduleSettings", {}).get("playoffTeamCount")
     for tid, t in teams.items():
         rec = t.get("record", {}).get("overall", {})
         tc = t.get("transactionCounter", {})
-        oid, oname = towner[tid]
+        oid, oname, allnames = towner[tid]
         tables["teams"].append({
             "season": season, "team_id": tid, "team_name": tname[tid],
-            "abbrev": t.get("abbrev"), "owner_id": oid, "owner": oname,
+            "abbrev": t.get("abbrev"), "owner_id": oid, "owner": oname, "all_owners": allnames,
             "wins": rec.get("wins"), "losses": rec.get("losses"), "ties": rec.get("ties"),
             "points_for": round(rec.get("pointsFor", t.get("points", 0)) or 0, 2),
             "points_against": round(rec.get("pointsAgainst", 0) or 0, 2),
             "playoff_seed": t.get("playoffSeed"),
+            "playoff_teams": playoff_teams,
+            "made_playoffs": bool(playoff_teams and t.get("playoffSeed")
+                                  and t["playoffSeed"] <= playoff_teams),
             "final_rank": t.get("rankCalculatedFinal") or t.get("rankFinal"),
             "draft_day_projected_rank": t.get("draftDayProjectedRank"),
             "acquisitions": tc.get("acquisitions"), "drops": tc.get("drops"),
@@ -215,11 +221,11 @@ def export_season(api: ESPN, season: int, tables: dict[str, list], skip_weekly: 
             "season": season, "matchup_period": m.get("matchupPeriodId"),
             "playoff_tier": m.get("playoffTierType", "NONE"),
             "home_team_id": h_id, "home_team": tname.get(h_id),
-            "home_owner_id": towner.get(h_id, ("", ""))[0], "home_owner": towner.get(h_id, ("", ""))[1],
+            "home_owner_id": towner.get(h_id, ("", "", ""))[0], "home_owner": towner.get(h_id, ("", "", ""))[1],
             "home_score": round(home.get("totalPoints", 0) or 0, 2),
             "away_team_id": a_id, "away_team": tname.get(a_id) if a_id else "BYE",
-            "away_owner_id": towner.get(a_id, ("", ""))[0] if a_id else "",
-            "away_owner": towner.get(a_id, ("", ""))[1] if a_id else "",
+            "away_owner_id": towner.get(a_id, ("", "", ""))[0] if a_id else "",
+            "away_owner": towner.get(a_id, ("", "", ""))[1] if a_id else "",
             "away_score": round(away.get("totalPoints", 0) or 0, 2) if away else None,
             "winner": m.get("winner"),
         })
@@ -233,7 +239,7 @@ def export_season(api: ESPN, season: int, tables: dict[str, list], skip_weekly: 
         tables["draft"].append({
             "season": season, "overall_pick": p.get("overallPickNumber") or p.get("id"),
             "round": p.get("roundId"), "round_pick": p.get("roundPickNumber"),
-            "team_id": tid, "team_name": tname.get(tid), "owner": towner.get(tid, ("", ""))[1],
+            "team_id": tid, "team_name": tname.get(tid), "owner": towner.get(tid, ("", "", ""))[1],
             "player_id": pid, "player": pname(pid),
             "position": players.get(pid, {}).get("position", ""),
             "bid_amount": p.get("bidAmount") if auction else "",
@@ -271,7 +277,7 @@ def export_season(api: ESPN, season: int, tables: dict[str, list], skip_weekly: 
                         tables["lineups"].append({
                             "season": season, "matchup_period": mp, "week": week,
                             "team_id": s.get("teamId"), "team_name": tname.get(s.get("teamId")),
-                            "owner": towner.get(s.get("teamId"), ("", ""))[1],
+                            "owner": towner.get(s.get("teamId"), ("", "", ""))[1],
                             "player_id": e.get("playerId"),
                             "player": pl.get("fullName") or pname(e.get("playerId")),
                             "position": POSITIONS.get(pl.get("defaultPositionId"), ""),
@@ -292,11 +298,14 @@ def export_season(api: ESPN, season: int, tables: dict[str, list], skip_weekly: 
                     if it.get("type") == "LINEUP":
                         continue
                     pid = it.get("playerId")
+                    team_id = t.get("teamId")
+                    if team_id is None or team_id < 0:
+                        team_id = it.get("toTeamId") if it.get("type") == "ADD" else it.get("fromTeamId")
                     tables["transactions"].append({
                         "season": season, "week": week, "date": ts(t.get("processDate") or t.get("proposedDate")),
                         "source": "transactions", "transaction_id": t["id"], "type": t.get("type"),
                         "action": it.get("type"),
-                        "team_id": t.get("teamId"), "team_name": tname.get(t.get("teamId")),
+                        "team_id": team_id, "team_name": tname.get(team_id, ""),
                         "from_team": tname.get(it.get("fromTeamId"), "") if it.get("fromTeamId", -1) >= 0 else "",
                         "to_team": tname.get(it.get("toTeamId"), "") if it.get("toTeamId", -1) >= 0 else "",
                         "player_id": pid, "player": pname(pid), "bid_amount": t.get("bidAmount"),
@@ -346,15 +355,36 @@ def export_activity_feed(api: ESPN, season: int, tables, tname, pname) -> int:
 # all-time aggregates
 
 def all_time(tables: dict[str, list]):
-    # Group by ESPN member id (stable even if someone renames); display their latest name.
-    owners = defaultdict(lambda: defaultdict(float))
-    season_owner = {(r["season"], r["team_id"]): r["owner_id"] for r in tables["teams"]}
-    display = {}
-    for r in sorted(tables["teams"], key=lambda r: r["season"]):
-        display[r["owner_id"]] = r["owner"]
+    # One person can show up under several ESPN account ids (new account) or several names
+    # (renamed profile). Treat ids that share a name, or names that share an id, as one person.
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def norm(name):
+        return "name:" + " ".join(str(name).lower().split())
 
     for r in tables["teams"]:
-        o = owners[r["owner_id"]]
+        parent[find("id:" + r["owner_id"])] = find(norm(r["owner"]))
+    person = {r["owner_id"]: find("id:" + r["owner_id"]) for r in tables["teams"]}
+
+    def key(owner_id):
+        return person.get(owner_id, owner_id)
+
+    owners = defaultdict(lambda: defaultdict(float))
+    season_owner = {(r["season"], r["team_id"]): key(r["owner_id"]) for r in tables["teams"]}
+    display = {}
+    for r in sorted(tables["teams"], key=lambda r: r["season"]):
+        if "@" not in r["owner"] or key(r["owner_id"]) not in display:
+            display[key(r["owner_id"])] = r["owner"]
+
+    for r in tables["teams"]:
+        o = owners[key(r["owner_id"])]
         o["seasons"] += 1
         for k in ("wins", "losses", "ties"):
             o[k] += r[k] or 0
@@ -367,19 +397,18 @@ def all_time(tables: dict[str, list]):
         o["trades"] += r["trades"] or 0
         o["acquisitions"] += r["acquisitions"] or 0
 
-    # playoff appearances: any winners-bracket matchup
-    playoff = {(m["season"], tid) for m in tables["matchups"] if m["playoff_tier"] == "WINNERS_BRACKET"
-               for tid in (m["home_team_id"], m["away_team_id"]) if tid is not None}
-    for season, tid in playoff:
-        if (season, tid) in season_owner:
-            owners[season_owner[(season, tid)]]["playoff_appearances"] += 1
+    # Playoff appearances come from seed vs. the league's playoff team count. (Older seasons
+    # label consolation games as WINNERS_BRACKET, so bracket tiers can't be trusted.)
+    for r in tables["teams"]:
+        if r.get("made_playoffs") in (True, "True"):
+            owners[key(r["owner_id"])]["playoff_appearances"] += 1
 
     high = defaultdict(float)
     h2h = defaultdict(lambda: defaultdict(float))
     for m in tables["matchups"]:
         if m["away_team_id"] is None or m["winner"] not in ("HOME", "AWAY", "TIE"):
             continue
-        a, b = m["home_owner_id"], m["away_owner_id"]
+        a, b = key(m["home_owner_id"]), key(m["away_owner_id"])
         high[a] = max(high[a], m["home_score"])
         high[b] = max(high[b], m["away_score"])
         kind = "regular" if m["playoff_tier"] == "NONE" else "playoff"
